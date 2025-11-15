@@ -8,7 +8,6 @@ from flask_cors import CORS
 app = Flask(__name__)
 
 # --- UPDATED CORS CONFIGURATION ---
-# We are making our CORS policy more explicit to handle the browser's 'OPTIONS' preflight request.
 CORS(app, resources={
     r"/api/fix": {
         "origins": "*",  # Allow any origin
@@ -18,20 +17,37 @@ CORS(app, resources={
 })
 # --- END OF UPDATE ---
 
+# --- MODIFICATION: Initialize model to None ---
+model = None
+# --- END MODIFICATION ---
+
 # Configure the Gemini API
 try:
     GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
     if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY environment variable not set.")
+        # This is the most likely error
+        raise ValueError("GEMINI_API_KEY environment variable not set or empty.")
+    
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-1.5-flash')
+    print("Gemini model initialized successfully.") # Added log
+
 except Exception as e:
-    print(f"Error configuring Gemini: {e}")
+    # This will now print the *real* error to your server logs
+    print(f"CRITICAL ERROR: Failed to configure Gemini: {e}")
+    print("The 'model' variable is NOT defined. All API calls will fail.")
 
 def call_gemini_to_fix_code(files_data, instructions, opt_lint, opt_comments):
     """
     Uses the Gemini API to analyze and fix a set of files.
     """
+    # --- MODIFICATION: Check if model is initialized ---
+    if model is None:
+        print("Error: call_gemini_to_fix_code called, but model is None.")
+        # This new error message will appear in the frontend popup
+        return {"error": "Server Error: The AI model failed to initialize. Check server logs for details."}
+    # --- END MODIFICATION ---
+
     if not files_data:
         return {}
 
@@ -70,7 +86,6 @@ def call_gemini_to_fix_code(files_data, instructions, opt_lint, opt_comments):
     prompt = "\n".join(prompt_parts)
     
     print("--- Sending prompt to Gemini ---")
-    # print(prompt) # Uncomment for debugging, but careful with large files
     print("--------------------------------")
 
     try:
@@ -101,6 +116,7 @@ def call_gemini_to_fix_code(files_data, instructions, opt_lint, opt_comments):
         return fixed_files
 
     except Exception as e:
+        # This will now catch runtime errors from Gemini
         print(f"Error calling Gemini API: {e}")
         return {"error": f"Error calling Gemini: {e}"}
 
@@ -117,13 +133,22 @@ def fix_code():
 
         files = request.files.getlist('files')
         instructions = request.form.get('instructions', '')
-        opt_lint = request.form.get('optLint') == '1'
-        opt_comments = request.form.get('optComments') == '1'
+        _lint = request.form.get('optLint')
+        opt_lint = _lint == '1' if _lint is not None else False
+        _comments = request.form.get('optComments')
+        opt_comments = _comments == '1' if _comments is not None else True
+
 
         original_files = {}
         for file in files:
             # file.filename is the webkitRelativePath we sent
-            original_files[file.filename] = file.read().decode('utf-8')
+            try:
+                original_files[file.filename] = file.read().decode('utf-8')
+            except UnicodeDecodeError:
+                print(f"Skipping file {file.filename} due to decode error")
+
+        if not original_files:
+            return jsonify({"error": "No valid text files found to process."}), 400
 
         # Call the AI to get the *changed* files
         fixed_files_map = call_gemini_to_fix_code(original_files, instructions, opt_lint, opt_comments)
@@ -139,7 +164,7 @@ def fix_code():
                 # If the AI provided a fix, use it.
                 # Otherwise, write the original file back.
                 final_content = fixed_files_map.get(path, content)
-                zf.writestr(path, final_content)
+                zf.writestr(path, final_content.encode('utf-8'))
 
         zip_buffer.seek(0)
         
